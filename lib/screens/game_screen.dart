@@ -1,14 +1,9 @@
 import 'dart:async';
 import 'dart:io';
-import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
-import 'package:gal/gal.dart';
 import 'package:shared_preferences/shared_preferences.dart';
-// audioplayers is required for sound alerts.
-// Add to pubspec.yaml:  audioplayers: ^6.1.0
-// Add asset file:       assets/sounds/afk_alert.mp3  (any short beep ≤1 s)
 import 'package:audioplayers/audioplayers.dart';
 import 'package:vibration/vibration.dart';
 import '../core/feature_registry.dart';
@@ -29,10 +24,23 @@ class _GameScreenState extends State<GameScreen> {
 
   final String _currentUrl        = 'https://play.rn04.rs/rs2.cgi';
   final String _currentWorldLabel = 'RN04';
-  bool   _pageLoading       = true;
-  bool   _screenshotFlash   = false;
-  int    _loadGen           = 0;
-  double _zoomLevel         = 0.90;
+  bool   _pageLoading = true;
+  int    _loadGen     = 0;
+
+  // ── Per-tab zoom ──────────────────────────────────────────────────────────
+  final List<double> _tabZoom = [0.90, 1.00, 1.00];
+  static const List<String> _tabZoomKeys = [
+    'zoom_game', 'zoom_hiscores', 'zoom_market'
+  ];
+
+  double get _currentZoom => _tabZoom[_activeTab];
+
+  // ── Tabs ──────────────────────────────────────────────────────────────────
+  int _activeTab = 0;
+  InAppWebViewController? _hiscoresController;
+  bool _hiscoresLoading = false;
+  InAppWebViewController? _marketController;
+  bool _marketLoading = false;
 
   // ── Ping ──────────────────────────────────────────────────────────────────
   int?   _pingMs;
@@ -100,10 +108,13 @@ class _GameScreenState extends State<GameScreen> {
   }
 
   Future<void> _initAudio() async {
-    await _audioPlayer.setReleaseMode(ReleaseMode.stop);
-    // Pre-load the asset so first play has no delay and no missing-source error.
-    await _audioPlayer.setSource(AssetSource('sounds/afk_alert.mp3'));
-    debugPrint('AFK audio pre-loaded OK');
+    try {
+      await _audioPlayer.setReleaseMode(ReleaseMode.stop);
+      await _audioPlayer.setSource(AssetSource('sounds/afk_alert.mp3'));
+      debugPrint('AFK audio pre-loaded OK');
+    } catch (e) {
+      debugPrint('AFK audio init skipped: $e');
+    }
   }
 
   @override
@@ -118,18 +129,21 @@ class _GameScreenState extends State<GameScreen> {
 
   Future<void> _loadPrefs() async {
     final prefs = await SharedPreferences.getInstance();
-    final zoom  = prefs.getDouble('game_zoom') ?? 0.90;
+    final zoomGame      = prefs.getDouble('zoom_game')      ?? 0.90;
+    final zoomHiscores  = prefs.getDouble('zoom_hiscores')  ?? 1.00;
+    final zoomMarket    = prefs.getDouble('zoom_market')    ?? 1.00;
 
-    // AFK settings — enabled is always false on startup
     final afkThreshold  = prefs.getInt('afk_threshold')  ?? 10;
     final afkSound      = prefs.getBool('afk_sound')      ?? true;
     final afkVibration  = prefs.getBool('afk_vibration')  ?? true;
 
     if (mounted) {
       setState(() {
-        _zoomLevel = zoom;
+        _tabZoom[0] = zoomGame;
+        _tabZoom[1] = zoomHiscores;
+        _tabZoom[2] = zoomMarket;
         _afkSettings = AfkTimerSettings(
-          enabled          : false, // always off on startup
+          enabled          : false,
           soundEnabled     : afkSound,
           vibrationEnabled : afkVibration,
           thresholdSeconds : afkThreshold,
@@ -143,7 +157,6 @@ class _GameScreenState extends State<GameScreen> {
 
   Future<void> _saveAfkSettings(AfkTimerSettings s) async {
     final prefs = await SharedPreferences.getInstance();
-    // Never persist 'enabled' — it always starts false
     await prefs.setInt ('afk_threshold',  s.thresholdSeconds);
     await prefs.setBool('afk_sound',      s.soundEnabled);
     await prefs.setBool('afk_vibration',  s.vibrationEnabled);
@@ -155,7 +168,7 @@ class _GameScreenState extends State<GameScreen> {
     FeatureRegistry.features.clear();
     FeatureRegistry.registerAll([
       ZoomFeature(
-        currentZoom   : _zoomLevel,
+        currentZoom   : _currentZoom,
         onZoomChanged : _onZoomChanged,
       ),
       AfkTimerFeature(
@@ -165,10 +178,22 @@ class _GameScreenState extends State<GameScreen> {
     ]);
   }
 
-  void _onZoomChanged(double zoom) {
-    setState(() => _zoomLevel = zoom);
-    _webViewController?.evaluateJavascript(source: _zoomJS(zoom));
+  void _onZoomChanged(double zoom) async {
+    setState(() => _tabZoom[_activeTab] = zoom);
+    final ctrl = _controllerForTab(_activeTab);
+    ctrl?.evaluateJavascript(source: _zoomJS(zoom));
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setDouble(_tabZoomKeys[_activeTab], zoom);
     _registerFeatures();
+  }
+
+  InAppWebViewController? _controllerForTab(int tab) {
+    switch (tab) {
+      case 0: return _webViewController;
+      case 1: return _hiscoresController;
+      case 2: return _marketController;
+      default: return null;
+    }
   }
 
   void _onAfkSettingsChanged(AfkTimerSettings next) {
@@ -191,11 +216,17 @@ class _GameScreenState extends State<GameScreen> {
     _scaffoldKey.currentState?.openDrawer();
   }
 
+  void _switchTab(int index) {
+    setState(() => _activeTab = index);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _controllerForTab(index)
+          ?.evaluateJavascript(source: _zoomJS(_tabZoom[index]));
+    });
+    _registerFeatures();
+  }
+
   // ── AFK Timer ─────────────────────────────────────────────────────────────
 
-  /// Called on every pointer-down that lands on the game WebView area.
-  /// The Listener uses HitTestBehavior.translucent so this fires without
-  /// consuming the touch — the game receives it normally.
   void _onGameTouch() {
     if (!_afkSettings.enabled) return;
     _resetAfkTimer();
@@ -219,22 +250,18 @@ class _GameScreenState extends State<GameScreen> {
         debugPrint('AFK ALERT FIRING — sound=${_afkSettings.soundEnabled}  vib=${_afkSettings.vibrationEnabled}');
         _triggerAfkAlert();
       }
-      // Timer intentionally never cancelled — continues into negative territory
-      // so the badge turns blue and shows -MM:SS until user touches the screen.
     });
   }
 
   Future<void> _triggerAfkAlert() async {
     debugPrint('_triggerAfkAlert() entered');
 
-    // ── Sound — resume pre-loaded asset ────────────────────────────
     if (_afkSettings.soundEnabled) {
       try {
         await _audioPlayer.resume();
         debugPrint('AFK sound resume() OK');
       } catch (e) {
         debugPrint('AFK sound error: $e');
-        // Fallback: reload and play from scratch.
         try {
           await _audioPlayer.play(AssetSource('sounds/afk_alert.mp3'));
           debugPrint('AFK sound fallback play() OK');
@@ -244,15 +271,13 @@ class _GameScreenState extends State<GameScreen> {
       }
     }
 
-    // ── Vibration — uses `vibration` package for reliable Android motor ──
     if (_afkSettings.vibrationEnabled) {
       try {
         final hasVibrator = await Vibration.hasVibrator() ?? false;
         if (hasVibrator) {
-          // Pattern: wait 0ms, buzz 400ms, pause 150ms, buzz 400ms, pause 150ms, buzz 400ms
           await Vibration.vibrate(
-            pattern  : [0, 400, 150, 400, 150, 400],
-            intensities: [0, 255, 0, 255, 0, 255],
+            pattern    : [0, 400, 150, 400, 150, 400],
+            intensities: [0, 255, 0,   255, 0,   255],
           );
           debugPrint('AFK vibration fired');
         } else {
@@ -309,58 +334,13 @@ class _GameScreenState extends State<GameScreen> {
 
       final ready = await ctrl.evaluateJavascript(source: 'window._lkReady === true;');
       if (ready == true || ready == 'true') {
-        await ctrl.evaluateJavascript(source: _zoomJS(_zoomLevel));
+        await ctrl.evaluateJavascript(source: _zoomJS(_tabZoom[0]));
         if (mounted && _loadGen == gen) setState(() => _pageLoading = false);
         return;
       }
     }
-    await ctrl.evaluateJavascript(source: _zoomJS(_zoomLevel));
+    await ctrl.evaluateJavascript(source: _zoomJS(_tabZoom[0]));
     if (mounted && _loadGen == gen) setState(() => _pageLoading = false);
-  }
-
-  // ── Screenshot ────────────────────────────────────────────────────────────
-
-  Future<void> _takeScreenshot() async {
-    try {
-      setState(() => _screenshotFlash = true);
-      await Future.delayed(const Duration(milliseconds: 120));
-      setState(() => _screenshotFlash = false);
-
-      final Uint8List? screenshot = await _webViewController?.takeScreenshot();
-      if (screenshot == null || !mounted) return;
-
-      final timestamp = DateTime.now().millisecondsSinceEpoch;
-      await Gal.putImageBytes(screenshot, name: 'lostkit_$timestamp');
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('📸 Screenshot saved to gallery',
-                style: TextStyle(fontFamily: 'RuneScape', fontSize: 12, color: Colors.white)),
-            backgroundColor: Color(0xFF1A1A1A),
-            duration: Duration(seconds: 2),
-            behavior: SnackBarBehavior.floating,
-            margin: EdgeInsets.only(bottom: 20, left: 16, right: 16),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.zero),
-          ),
-        );
-      }
-    } catch (e) {
-      debugPrint('Screenshot error: $e');
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('⚠ Screenshot failed',
-                style: TextStyle(fontFamily: 'RuneScape', fontSize: 12, color: Colors.white)),
-            backgroundColor: Color(0xFF8B0000),
-            duration: Duration(seconds: 2),
-            behavior: SnackBarBehavior.floating,
-            margin: EdgeInsets.only(bottom: 20, left: 16, right: 16),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.zero),
-          ),
-        );
-      }
-    }
   }
 
   // ── Build ─────────────────────────────────────────────────────────────────
@@ -375,48 +355,111 @@ class _GameScreenState extends State<GameScreen> {
       body: Stack(
         children: [
 
-          // ── WebView wrapped in Listener for AFK touch detection ────
-          // HitTestBehavior.translucent means the Listener fires for
-          // every pointer-down but does NOT consume the event —
-          // the WebView (and therefore the game) receives it normally.
-          Listener(
-            behavior: HitTestBehavior.translucent,
-            onPointerDown: (_) => _onGameTouch(),
-            child: InAppWebView(
-              initialUrlRequest: URLRequest(url: WebUri(_currentUrl)),
-              initialSettings: InAppWebViewSettings(
-                javaScriptEnabled               : true,
-                mediaPlaybackRequiresUserGesture: false,
-                allowsInlineMediaPlayback       : true,
-                useHybridComposition            : true,
-                supportZoom                     : false,
-                builtInZoomControls             : false,
-                displayZoomControls             : false,
-                horizontalScrollBarEnabled      : false,
-                verticalScrollBarEnabled        : false,
-                userAgent: 'Mozilla/5.0 (Linux; Android 11; Mobile) RN04Launcher/1.0',
+          // ── Both tabs always mounted, game runs in background ──────
+          IndexedStack(
+            index: _activeTab,
+            children: [
+
+              // ── Tab 0: Game ────────────────────────────────────────
+              Listener(
+                behavior: HitTestBehavior.translucent,
+                onPointerDown: (_) => _onGameTouch(),
+                child: InAppWebView(
+                  initialUrlRequest: URLRequest(url: WebUri(_currentUrl)),
+                  initialSettings: InAppWebViewSettings(
+                    javaScriptEnabled               : true,
+                    mediaPlaybackRequiresUserGesture: false,
+                    allowsInlineMediaPlayback       : true,
+                    useHybridComposition            : true,
+                    supportZoom                     : false,
+                    builtInZoomControls             : false,
+                    displayZoomControls             : false,
+                    horizontalScrollBarEnabled      : false,
+                    verticalScrollBarEnabled        : false,
+                    userAgent: 'Mozilla/5.0 (Linux; Android 11; Mobile) RN04Launcher/1.0',
+                  ),
+                  onWebViewCreated: (controller) {
+                    _webViewController = controller;
+                  },
+                  onLoadStart: (controller, url) {
+                    _loadGen++;
+                    controller.evaluateJavascript(source: 'window._lkReady = false;');
+                    if (mounted) setState(() => _pageLoading = true);
+                  },
+                  onLoadStop: (controller, url) async {
+                    final gen = _loadGen;
+                    await _applyFullscreen(controller, gen);
+                  },
+                  shouldOverrideUrlLoading: (controller, navigationAction) async {
+                    final url = navigationAction.request.url?.toString() ?? '';
+                    if (url.startsWith('https://play.rn04.rs/') || url.isEmpty) {
+                      return NavigationActionPolicy.ALLOW;
+                    }
+                    return NavigationActionPolicy.CANCEL;
+                  },
+                  onReceivedError: (controller, request, error) {
+                    debugPrint('WebView error: ${error.description}');
+                    if (mounted) setState(() => _pageLoading = false);
+                  },
+                ),
               ),
-              onWebViewCreated: (controller) {
-                _webViewController = controller;
-              },
-              onLoadStart: (controller, url) {
-                _loadGen++;
-                controller.evaluateJavascript(source: 'window._lkReady = false;');
-                if (mounted) setState(() => _pageLoading = true);
-              },
-              onLoadStop: (controller, url) async {
-                final gen = _loadGen;
-                await _applyFullscreen(controller, gen);
-              },
-              onReceivedError: (controller, request, error) {
-                debugPrint('WebView error: ${error.description}');
-                if (mounted) setState(() => _pageLoading = false);
-              },
-            ),
+
+              // ── Tab 1: Hiscores ────────────────────────────────────
+              InAppWebView(
+                initialUrlRequest: URLRequest(
+                  url: WebUri('https://highscores.rn04.rs'),
+                ),
+                initialSettings: InAppWebViewSettings(
+                  javaScriptEnabled         : true,
+                  useHybridComposition      : true,
+                  supportZoom               : true,
+                  horizontalScrollBarEnabled: false,
+                  verticalScrollBarEnabled  : false,
+                ),
+                onWebViewCreated: (controller) {
+                  _hiscoresController = controller;
+                },
+                onLoadStart: (controller, url) {
+                  if (mounted) setState(() => _hiscoresLoading = true);
+                },
+                onLoadStop: (controller, url) {
+                  if (mounted) setState(() => _hiscoresLoading = false);
+                },
+                onReceivedError: (controller, request, error) {
+                  if (mounted) setState(() => _hiscoresLoading = false);
+                },
+              ),
+
+              // ── Tab 2: Market ──────────────────────────────────────
+              InAppWebView(
+                initialUrlRequest: URLRequest(
+                  url: WebUri('https://markets.rn04.rs'),
+                ),
+                initialSettings: InAppWebViewSettings(
+                  javaScriptEnabled         : true,
+                  useHybridComposition      : true,
+                  supportZoom               : true,
+                  horizontalScrollBarEnabled: false,
+                  verticalScrollBarEnabled  : false,
+                ),
+                onWebViewCreated: (controller) {
+                  _marketController = controller;
+                },
+                onLoadStart: (controller, url) {
+                  if (mounted) setState(() => _marketLoading = true);
+                },
+                onLoadStop: (controller, url) {
+                  if (mounted) setState(() => _marketLoading = false);
+                },
+                onReceivedError: (controller, request, error) {
+                  if (mounted) setState(() => _marketLoading = false);
+                },
+              ),
+            ],
           ),
 
-          // Loading overlay
-          if (_pageLoading)
+          // ── Game loading overlay ───────────────────────────────────
+          if (_pageLoading && _activeTab == 0)
             Container(
               color: const Color(0xFF000000),
               child: Center(
@@ -437,72 +480,92 @@ class _GameScreenState extends State<GameScreen> {
               ),
             ),
 
-          // Screenshot flash
-          if (_screenshotFlash)
-            IgnorePointer(child: Container(color: Colors.white.withOpacity(0.5))),
-
-          // ── Top-left: menu button ──────────────────────────────────
+          // ── Top bar ────────────────────────────────────────────────
           Positioned(
-            top: 6, left: 6,
-            child: GestureDetector(
-              onTap: _openPanel,
-              child: _FloatButton(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: List.generate(3, (_) => Container(
-                    margin: const EdgeInsets.symmetric(vertical: 2),
-                    width: 16, height: 2,
-                    color: const Color(0xFFC8A450),
-                  )),
-                ),
-              ),
-            ),
-          ),
-
-          // ── World label with ping stacked below it ─────────────────
-          Positioned(
-            top: 8, left: 48,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 4),
-              color: const Color(0xAA000000),
-              child: Column(
+            top: 0, left: 0, right: 0,
+            child: SafeArea(
+              child: Row(
                 crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
                 children: [
-                  // World name
-                  Text(
-                    _currentWorldLabel,
-                    style: const TextStyle(
-                      fontFamily : 'RuneScape',
-                      color      : Color(0xFFC8A450),
-                      fontSize   : 11,
-                      fontWeight : FontWeight.bold,
+                  // Menu button
+                  GestureDetector(
+                    onTap: _openPanel,
+                    child: _FloatButton(
+                      child: Column(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: List.generate(3, (_) => Container(
+                          margin: const EdgeInsets.symmetric(vertical: 2),
+                          width: 16, height: 2,
+                          color: const Color(0xFFC8A450),
+                        )),
+                      ),
                     ),
                   ),
-                  const SizedBox(height: 3),
-                  // Ping dot + ms
-                  Row(
+                  const SizedBox(width: 4),
+
+                  // ── Left column: ping → tabs ───────────────────────
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
+                      // Ping row
                       Container(
-                        width: 5, height: 5,
-                        decoration: BoxDecoration(
-                          shape: BoxShape.circle,
-                          color: _pingMs != null
-                              ? _pingColor(_pingMs!)
-                              : const Color(0xFF444444),
+                        padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                        color: const Color(0xAA000000),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              width: 5, height: 5,
+                              decoration: BoxDecoration(
+                                shape: BoxShape.circle,
+                                color: _pingMs != null
+                                    ? _pingColor(_pingMs!)
+                                    : const Color(0xFF444444),
+                              ),
+                            ),
+                            const SizedBox(width: 4),
+                            Text(
+                              _pingMs != null ? '${_pingMs}ms' : '---',
+                              style: TextStyle(
+                                fontFamily: 'RuneScape',
+                                fontSize  : 9,
+                                color     : _pingMs != null
+                                    ? _pingColor(_pingMs!)
+                                    : const Color(0xFF555555),
+                              ),
+                            ),
+                          ],
                         ),
                       ),
-                      const SizedBox(width: 4),
-                      Text(
-                        _pingMs != null ? '${_pingMs}ms' : '---',
-                        style: TextStyle(
-                          fontFamily: 'RuneScape',
-                          fontSize  : 9,
-                          color     : _pingMs != null
-                              ? _pingColor(_pingMs!)
-                              : const Color(0xFF555555),
-                        ),
+                      const SizedBox(height: 2),
+
+                      // RN04 tab chip
+                      _TabChip(
+                        label: _currentWorldLabel,
+                        icon: Icons.sports_esports,
+                        active: _activeTab == 0,
+                        onTap: () => _switchTab(0),
+                      ),
+                      const SizedBox(height: 2),
+
+                      // Hiscores tab chip
+                      _TabChip(
+                        label: 'Hiscores',
+                        icon: Icons.leaderboard,
+                        active: _activeTab == 1,
+                        loading: _hiscoresLoading && _activeTab == 1,
+                        onTap: () => _switchTab(1),
+                      ),
+                      const SizedBox(height: 2),
+
+                      // Market tab chip
+                      _TabChip(
+                        label: 'Market',
+                        icon: Icons.storefront,
+                        active: _activeTab == 2,
+                        loading: _marketLoading && _activeTab == 2,
+                        onTap: () => _switchTab(2),
                       ),
                     ],
                   ),
@@ -511,26 +574,10 @@ class _GameScreenState extends State<GameScreen> {
             ),
           ),
 
-          // ── Top-right: screenshot button ───────────────────────────
-          Positioned(
-            top: 6, right: 6,
-            child: GestureDetector(
-              onTap: _takeScreenshot,
-              child: _FloatButton(
-                child: Image.asset(
-                  'assets/capture.png',
-                  width: 20, height: 20,
-                  errorBuilder: (_, __, ___) => const Icon(
-                      Icons.camera_alt, color: Color(0xFFC8A450), size: 18),
-                ),
-              ),
-            ),
-          ),
-
-          // ── AFK badge below screenshot button (only when enabled) ──
-          if (_afkSettings.enabled)
+          // ── AFK badge (game tab only) ──────────────────────────────
+          if (_afkSettings.enabled && _activeTab == 0)
             Positioned(
-              top: 44, right: 6,   // 6 (top) + 34 (button) + 4 (gap)
+              top: 44, right: 6,
               child: _AfkBadge(
                 remaining       : _afkRemaining,
                 thresholdSeconds: _afkSettings.thresholdSeconds,
@@ -554,7 +601,7 @@ class _AfkBadge extends StatelessWidget {
   });
 
   Color get _color {
-    if (remaining < 0)                       return const Color(0xFF4499FF); // blue — expired
+    if (remaining < 0)                       return const Color(0xFF4499FF);
     if (remaining <= thresholdSeconds)       return const Color(0xFFCC0000);
     if (remaining <= thresholdSeconds + 10)  return const Color(0xFFCCAA00);
     return const Color(0xFF44CC44);
@@ -609,7 +656,72 @@ class _AfkBadge extends StatelessWidget {
   }
 }
 
-// ── Float button (unchanged) ──────────────────────────────────────────────────
+// ── Tab chip widget ───────────────────────────────────────────────────────────
+
+class _TabChip extends StatelessWidget {
+  final String label;
+  final IconData icon;
+  final bool active;
+  final bool loading;
+  final VoidCallback onTap;
+
+  const _TabChip({
+    required this.label,
+    required this.icon,
+    required this.active,
+    required this.onTap,
+    this.loading = false,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+        decoration: BoxDecoration(
+          color: active ? const Color(0xCC000000) : const Color(0x88000000),
+          border: Border.all(
+            color: active ? const Color(0xFFCC0000) : const Color(0x44888888),
+            width: active ? 1.5 : 1,
+          ),
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            loading
+                ? const SizedBox(
+                    width: 10, height: 10,
+                    child: CircularProgressIndicator(
+                      color: Color(0xFFC8A450), strokeWidth: 1.5),
+                  )
+                : Icon(icon,
+                    size: 11,
+                    color: active
+                        ? const Color(0xFFC8A450)
+                        : const Color(0xFF666666)),
+            const SizedBox(width: 5),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 80),
+              child: Text(
+                label,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontFamily: 'RuneScape',
+                  fontSize: 10,
+                  color: active
+                      ? const Color(0xFFC8A450)
+                      : const Color(0xFF666666),
+                  fontWeight: active ? FontWeight.bold : FontWeight.normal,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
 
 class _FloatButton extends StatelessWidget {
   final Widget child;
