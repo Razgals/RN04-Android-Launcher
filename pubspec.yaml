@@ -1,5 +1,5 @@
 name: rn04_launcher
-description: RN04 Android Launcher
+description: RN04 Mobile Launcher
 version: 1.0.0+1
 
 environment:
@@ -11,6 +11,7 @@ dependencies:
   flutter_inappwebview: ^6.0.0
   http: ^1.2.0
   shared_preferences: ^2.2.2
+  gal: ^2.3.0
   audioplayers: ^6.1.0
   vibration: ^2.0.0
 
@@ -26,6 +27,7 @@ flutter:
     - assets/
     - assets/skillicons/
     - assets/sounds/
+    - assets/widgets/
     - assets/afktimer.png
     - assets/zoom.png
     - assets/rn04launcher.png

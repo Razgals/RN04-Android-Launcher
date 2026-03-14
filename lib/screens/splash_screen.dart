@@ -72,9 +72,8 @@ class _SplashScreenState extends State<SplashScreen>
                 ),
               ),
               const SizedBox(height: 14),
-              // RN04 Launcher — gold
               const Text(
-                'RN04 Launcher',
+                'RN04 Mobile',
                 style: TextStyle(
                   fontFamily: 'RuneScape',
                   fontSize: 34,
@@ -84,7 +83,6 @@ class _SplashScreenState extends State<SplashScreen>
                 ),
               ),
               const SizedBox(height: 8),
-              // By Akg — muted gold
               const Text(
                 'By Akg',
                 style: TextStyle(
@@ -96,15 +94,14 @@ class _SplashScreenState extends State<SplashScreen>
                 ),
               ),
               const SizedBox(height: 44),
-              // Loading bar — RED on BLACK only element
+              // Loading bar
               Container(
                 width: 200,
                 height: 6,
                 color: const Color(0xFF1A0000),
-                child: LinearProgressIndicator(
-                  backgroundColor: const Color(0xFF1A0000),
-                  valueColor: const AlwaysStoppedAnimation<Color>(
-                      Color(0xFFCC0000)),
+                child: const LinearProgressIndicator(
+                  backgroundColor: Color(0xFF1A0000),
+                  valueColor: AlwaysStoppedAnimation<Color>(Color(0xFFCC0000)),
                   minHeight: 6,
                 ),
               ),

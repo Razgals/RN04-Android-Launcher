@@ -129,7 +129,7 @@ class _ZoomPanelState extends State<ZoomPanel> {
             Wrap(
               spacing: 6,
               runSpacing: 6,
-              children: [0.75, 0.90, 1.00, 1.50, 2.00].map((preset) {
+              children: [0.75, 1.00, 1.20, 1.50, 2.00].map((preset) {
                 final active = (_zoom - preset).abs() < 0.01;
                 return GestureDetector(
                   onTap: () => _setZoom(preset),
@@ -146,7 +146,7 @@ class _ZoomPanelState extends State<ZoomPanel> {
                       ),
                     ),
                     child: Text(
-                      preset == 0.90 ? '90% ★' : '${(preset * 100).round()}%',
+                      preset == 1.20 ? '120% ★' : '${(preset * 100).round()}%',
                       style: TextStyle(
                         fontFamily: 'RuneScape',
                         fontSize: 11,
@@ -162,9 +162,9 @@ class _ZoomPanelState extends State<ZoomPanel> {
 
             // Reset
             GestureDetector(
-              onTap: () => _setZoom(0.9),
+              onTap: () => _setZoom(1.0),
               child: const Text(
-                'Reset to 90%',
+                'Reset to 100%',
                 style: TextStyle(
                   fontFamily: 'RuneScape',
                   color: Color(0xFF555555),
